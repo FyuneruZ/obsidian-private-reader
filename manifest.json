@@ -1,0 +1,9 @@
+{
+  "id": "private-reader",
+  "name": "Private Reader",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Download a dedicated OneDrive app-folder mirror into an Obsidian reading vault. Manual sync; no uploads or deletions.",
+  "author": "Private Vault Mirror",
+  "isDesktopOnly": false
+}
