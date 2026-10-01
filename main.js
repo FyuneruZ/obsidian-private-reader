@@ -1,4 +1,4 @@
-// Generated from src/ by build.cjs. Private Reader 0.1.0.
+// Generated from src/ by build.cjs. Private Reader 0.1.1.
 const __modules={};
 __modules.core=(()=>{const module={exports:{}};
 'use strict';
@@ -85,6 +85,11 @@ function graphURL(url) {
   return parsed;
 }
 function downloadURL(url) {
+  const parsed=new URL(url);
+  if(parsed.protocol!=='https:'||parsed.username||parsed.password)throw new Error('Microsoft 返回了不安全的下载地址。');
+  return parsed.href;
+}
+function cloudLinkURL(url) {
   const parsed=new URL(url),host=parsed.hostname.toLowerCase();
   const allowed=['1drv.com','live.com','sharepoint.com','sharepointonline.com','onedrive.com','onedriveusercontent.com'];
   if(parsed.protocol!=='https:'||parsed.username||parsed.password||!allowed.some(s=>host===s||host.endsWith('.'+s)))throw new Error('下载地址不属于受支持的 Microsoft 文件服务。');
@@ -135,7 +140,7 @@ class DeviceAuth {
   }
 }
 class AppFolderGraph {
-  constructor({request,auth,sleep=pause,cancelled=()=>false}){Object.assign(this,{request,auth,sleep,cancelled});this.allowedIds=new Set();}
+  constructor({request,auth,sleep=pause,cancelled=()=>false}){Object.assign(this,{request,auth,sleep,cancelled});this.allowedIds=new Set();this.downloadLinks=new Map();}
   async get(url) {
     graphURL(url);
     let force=false;
@@ -170,34 +175,45 @@ class AppFolderGraph {
       if(!Array.isArray(page.value))throw new Error('OneDrive 目录响应不完整。');
       for(const item of page.value) {
         if(!item.id)throw new Error('云端项目缺少 ID。');
-        this.allowedIds.add(item.id);yield item;
+        this.allowedIds.add(item.id);
+        if(item['@microsoft.graph.downloadUrl'])this.downloadLinks.set(item.id,item['@microsoft.graph.downloadUrl']);
+        yield item;
       }
       url=page['@odata.nextLink']||'';
     }
   }
   async download(item) {
     if(!this.allowedIds.has(item.id))throw new Error('不允许下载应用文件夹之外的文件。');
-    let url=item['@microsoft.graph.downloadUrl'];
-    if(!url)url=(await this.get(GRAPH+'/me/drive/items/'+encodeURIComponent(item.id)))['@microsoft.graph.downloadUrl'];
+    // Only links received directly from authenticated Graph responses are trusted.
+    // Never use a caller-supplied download URL, even for a known item ID.
+    let url=this.downloadLinks.get(item.id);
+    if(!url)url=await this.refreshDownloadLink(item.id);
     if(!url)throw new Error('文件没有可用的下载地址。');
     let response=await this.request({url:downloadURL(url),method:'GET',throw:false});
     // Download URLs carry their own short-lived permission: never attach the bearer token.
     if([401,403,404].includes(response.status)) {
-      const fresh=await this.get(GRAPH+'/me/drive/items/'+encodeURIComponent(item.id));
-      response=await this.request({url:downloadURL(fresh['@microsoft.graph.downloadUrl']),method:'GET',throw:false});
+      const fresh=await this.refreshDownloadLink(item.id);
+      response=await this.request({url:downloadURL(fresh),method:'GET',throw:false});
     }
     if(response.status!==200)throw new Error('文件下载失败（HTTP '+response.status+'），原文件保留。');
     return response.arrayBuffer;
   }
+  async refreshDownloadLink(id) {
+    const fresh=await this.get(GRAPH+'/me/drive/items/'+encodeURIComponent(id));
+    if(fresh.id!==id)throw new Error('Microsoft 返回的文件 ID 不匹配。');
+    const url=fresh['@microsoft.graph.downloadUrl'];
+    if(!url)throw new Error('文件没有可用的下载地址。');
+    downloadURL(url);this.downloadLinks.set(id,url);return url;
+  }
 }
-module.exports={SCOPE,GRAPH,graphURL,downloadURL,DeviceAuth,AppFolderGraph};
+module.exports={SCOPE,GRAPH,graphURL,downloadURL,cloudLinkURL,DeviceAuth,AppFolderGraph};
 
 return module.exports;})();
 __modules.main=(()=>{const module={exports:{}};
 'use strict';
 const {Plugin,PluginSettingTab,Setting,Modal,Notice,TFile,TFolder,MarkdownView,requestUrl}=require('obsidian');
 const {syncMirror,hash}=__modules.core;
-const {DeviceAuth,AppFolderGraph,downloadURL}=__modules.network;
+const {DeviceAuth,AppFolderGraph,cloudLinkURL}=__modules.network;
 const DEFAULTS={clientId:'b2a39a90-abb8-41e4-9e43-52d07fada54c',rememberLogin:false,readingMode:true,dedicatedVault:false,confirmedFolder:'',maxFileMB:50};
 class ProgressModal extends Modal {
   constructor(app,title){super(app);this.title=title;this.cancelled=false;this.finished=false;}
@@ -297,7 +313,7 @@ class ReaderSettings extends PluginSettingTab {
     const cloud=p.state.cloud;
     if(cloud){
       el.createEl('h3',{text:'Microsoft 分配的实际应用文件夹'});el.createEl('p',{text:cloud.name});
-      if(cloud.webUrl){try{const url=downloadURL(cloud.webUrl);el.createEl('a',{text:'在 OneDrive 中打开实际文件夹',attr:{href:url,target:'_blank',rel:'noopener noreferrer'}});}catch{el.createEl('p',{text:'云端链接无法验证，请在 OneDrive 中手动查找此应用文件夹。'});}}
+      if(cloud.webUrl){try{const url=cloudLinkURL(cloud.webUrl);el.createEl('a',{text:'在 OneDrive 中打开实际文件夹',attr:{href:url,target:'_blank',rel:'noopener noreferrer'}});}catch{el.createEl('p',{text:'云端链接无法验证，请在 OneDrive 中手动查找此应用文件夹。'});}}
       el.createEl('p',{text:'请核对电脑端镜像目标。Microsoft 可能新建应用目录，不能仅凭 Apps 下的同名文件夹认定两者相同。若目录不同，请在电脑端重新选择实际目录并同步，然后等待 OneDrive 上传完成。'});
       new Setting(el).setName('已核对电脑镜像使用此应用文件夹').addToggle(t=>t.setValue(p.settings.confirmedFolder===cloud.driveId+':'+cloud.id).onChange(value=>p.safe(async()=>{p.settings.confirmedFolder=value?cloud.driveId+':'+cloud.id:'';await p.persist();})));
     }
